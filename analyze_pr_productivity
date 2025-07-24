@@ -1,0 +1,403 @@
+import { graphql } from '@octokit/graphql';
+import axios from 'axios';
+import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc.js';
+import timezone from 'dayjs/plugin/timezone.js';
+import fs from 'fs';
+import path from 'path';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
+dayjs.tz.setDefault('Asia/Tokyo');
+
+// 環境変数でGitHubトークンを設定
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || 'YOUR_TOKEN_HERE';
+
+// GraphQL APIクライアントの設定
+const graphqlWithAuth = graphql.defaults({
+  headers: {
+    authorization: `token ${GITHUB_TOKEN}`
+  }
+});
+
+// 設定ファイルから設定を読み込む
+function loadConfigFile() {
+  const configPath = path.resolve(process.cwd(), 'date_range_config.json');
+  
+  try {
+    // 設定ファイルが存在する場合は読み込む
+    if (fs.existsSync(configPath)) {
+      console.log('設定ファイルを読み込みます:', configPath);
+      return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    }
+    
+    console.log('設定ファイルが存在しないため、デフォルト設定を使用します');
+    return {};
+  } catch (error) {
+    console.error('設定ファイルの読み込み中にエラーが発生しました:', error.message);
+    return {};
+  }
+}
+
+// 設定ファイルから日付範囲を取得
+function getDateRangeFromConfig() {
+  const configData = loadConfigFile();
+  
+  // モードによって処理を分ける
+  if (configData.mode === 'custom' && configData.startDate && configData.endDate) {
+    const startDate = dayjs(configData.startDate).tz('Asia/Tokyo');
+    const endDate = dayjs(configData.endDate).tz('Asia/Tokyo');
+    
+    return {
+      startDate: startDate.format('YYYY-MM-DD'),
+      endDate: endDate.format('YYYY-MM-DD'),
+      startDateRFC: startDate.startOf('day').format('YYYY-MM-DDTHH:mm:ssZ'),
+      endDateRFC: endDate.endOf('day').format('YYYY-MM-DDTHH:mm:ssZ'),
+      isCustomRange: true
+    };
+  } else if (configData.mode === 'lastMonth') {
+    // 前月モードの場合は前月の日付範囲を返す
+    return getLastMonthDateRange();
+  }
+  
+  // 設定ファイルの内容が不正な場合はデフォルトの前月範囲を返す
+  console.log('設定が無効なため、デフォルトの前月範囲を使用します');
+  return getLastMonthDateRange();
+}
+
+// 前月の日付範囲を取得
+function getLastMonthDateRange() {
+  const now = dayjs().tz('Asia/Tokyo');
+  const lastMonth = now.subtract(1, 'month');
+  const startOfLastMonth = lastMonth.startOf('month');
+  const endOfLastMonth = lastMonth.endOf('month');
+  
+  return {
+    startDate: startOfLastMonth.format('YYYY-MM-DD'),
+    endDate: endOfLastMonth.format('YYYY-MM-DD'),
+    startDateRFC: startOfLastMonth.format('YYYY-MM-DDTHH:mm:ssZ'),
+    endDateRFC: endOfLastMonth.format('YYYY-MM-DDTHH:mm:ssZ'),
+    isCustomRange: false
+  };
+}
+
+// 設定ファイルからリポジトリリストを取得
+async function searchRepositories() {
+  const configData = loadConfigFile();
+  
+  // 設定ファイルで特定のリポジトリが指定されている場合
+  if (configData.specificRepositories && Array.isArray(configData.specificRepositories) && 
+      configData.specificRepositories.length > 0) {
+    console.log(`設定ファイルで指定されたリポジトリを使用: ${configData.specificRepositories.join(', ')}`);
+    return configData.specificRepositories;
+  }
+  
+  // リポジトリが指定されていない場合は警告を表示して空配列を返す
+  console.log('警告: 設定ファイルにリポジトリが指定されていません。specificRepositoriesに分析対象リポジトリを指定してください。');
+  return [];
+}
+
+// PRがライブラリアップデート関連かどうかを判定
+function isLibraryUpdatePR(pr) {
+  // ファイルパスによる判定
+  const libraryFiles = pr.files.nodes.some(file => {
+    const path = file.path;
+    return path.startsWith('vendor/') ||
+            path.startsWith('node_modules/') ||
+            path === 'composer.json' ||
+            path === 'composer.lock' ||
+            path === 'package.json' ||
+            path === 'yarn.lock';
+  });
+
+  // タイトルや説明による判定
+  const libraryUpdateKeywords = [
+    'dependency', 'dependencies', 'bump',
+    'npm update', 'yarn upgrade', 'composer update'
+  ];
+  
+  // 誤検知しやすい単語はより厳密なチェックを行う
+  const preciseKeywords = ['update', 'upgrade'];
+  
+  // タイトルのキーワードチェック
+  const titleContainsKeywords = 
+    // 標準キーワードチェック
+    libraryUpdateKeywords.some(keyword => 
+      pr.title.toLowerCase().includes(keyword.toLowerCase())
+    ) ||
+    // 厳密なキーワードチェック（ライブラリ関連キーワードと一緒に使われている場合のみ）
+    (preciseKeywords.some(keyword => 
+      pr.title.toLowerCase().includes(keyword.toLowerCase())
+    ) && 
+    (pr.title.toLowerCase().includes('library') || 
+     pr.title.toLowerCase().includes('package') || 
+     pr.title.toLowerCase().includes('version') || 
+     pr.title.toLowerCase().includes('dep')));
+  
+  // 本文のキーワードチェック
+  const bodyContainsKeywords = pr.bodyText && (
+    // 標準キーワードチェック
+    libraryUpdateKeywords.some(keyword => 
+      pr.bodyText.toLowerCase().includes(keyword.toLowerCase())
+    ) ||
+    // 厳密なキーワードチェック（ライブラリ関連キーワードと一緒に使われている場合のみ）
+    (preciseKeywords.some(keyword => 
+      pr.bodyText.toLowerCase().includes(keyword.toLowerCase())
+    ) && 
+    (pr.bodyText.toLowerCase().includes('library') || 
+     pr.bodyText.toLowerCase().includes('package') || 
+     pr.bodyText.toLowerCase().includes('version') || 
+     pr.bodyText.toLowerCase().includes('dep')))
+  );
+  
+  return libraryFiles || titleContainsKeywords || bodyContainsKeywords;
+}
+
+// 指定されたリポジトリのPR情報を取得するGraphQLクエリ
+async function fetchPRsForRepository(repo, dateRange, baseRef = 'master', filterKeyword = null, owner = null) {
+  // GitHubオーナー名が指定されていない場合は設定ファイルから取得
+  if (!owner) {
+    const configData = loadConfigFile();
+    owner = configData.githubOwner;
+  }
+  
+  // ownerが設定されていない場合はエラーを投げる
+  if (!owner) {
+    throw new Error(`GitHubのオーナー名（組織名）が設定されていません。date_range_config.jsonにgithubOwnerを設定してください。`);
+  }
+  let hasNextPage = true;
+  let cursor = null;
+  let allPRs = [];
+  
+  // 前月のPRを取得するため、検索期間を強めに設定（範囲を広くして確実に取得）
+  const searchStartDate = dayjs(dateRange.startDateRFC).subtract(1, 'month').format('YYYY-MM-DD');
+  const searchEndDate = dayjs().add(1, 'day').format('YYYY-MM-DD');
+  
+  // 無限ループ防止用カウンター
+  let pageCounter = 0;
+  // リポジトリによってページ数制限を変更
+  const MAX_PAGES = 30 ;
+  
+  while (hasNextPage && pageCounter < MAX_PAGES) {
+    pageCounter++;
+    console.log(`  ${repo}: ページ ${pageCounter} を取得中...`);
+    
+    // GraphQLクエリを構築（baseRefで指定したブランチへのPRを検索）
+  const query = `
+      query($searchQuery: String!, $cursor: String) {
+        search(query: $searchQuery, type: ISSUE, first: 10, after: $cursor) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            ... on PullRequest {
+              title
+              bodyText
+              author {
+                login
+              }
+              mergedAt
+              additions
+              deletions
+              changedFiles
+              files(first: 100) {
+                nodes {
+                  path
+                  additions
+                  deletions
+                  changeType
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+    
+    const variables = {
+      searchQuery: `repo:${owner}/${repo} is:pr is:merged merged:${dateRange.startDate}..${dateRange.endDate} base:${baseRef} -author:dependabot`,
+      cursor
+    };
+    
+    try {
+      const result = await graphqlWithAuth(query, variables);
+      const prs = result.search.nodes;
+      
+      // 検索クエリは日付でフィルタリング済みなので、検索結果をそのまま使用
+      const filteredPRs = prs.filter(pr => {
+        // ボットのコミットを除外
+        if (pr.author && pr.author.login.includes('dependabot')) return false;
+        
+        return true;
+      });
+      
+      // 進捗表示
+      if (filteredPRs.length > 0) {
+        console.log(`  ${repo}: ${filteredPRs.length}件のマージ済みPRが見つかりました（${dateRange.startDate} ~ ${dateRange.endDate}）`);
+      }
+      
+      allPRs = allPRs.concat(filteredPRs);
+      
+      hasNextPage = result.search.pageInfo.hasNextPage;
+      cursor = result.search.pageInfo.endCursor;
+      
+      // ページがない場合は終了
+      if (!hasNextPage) {
+        break;
+      }
+    } catch (error) {
+      console.error(`リポジトリ ${repo} のPR取得中にエラー: ${error.message}`);
+      break;
+    }
+  }
+  
+  return allPRs;
+}
+
+async function main() {
+  try {
+    // 設定ファイルまたは前月の日付範囲を取得
+    const dateRange = getDateRangeFromConfig();
+    console.log(`分析対象期間: ${dateRange.startDate} から ${dateRange.endDate}${dateRange.isCustomRange ? ' (カスタム設定)' : ' (前月自動設定)'}`);
+    
+    // 対象リポジトリを取得
+    const repositories = await searchRepositories();
+    console.log(`検出されたリポジトリ: ${repositories.length}件`);
+    
+    // 結果を格納する変数
+    let totalPRs = 0;
+    let totalFiles = {
+      changed: 0,
+      added: 0,
+      deleted: 0,
+      modified: 0
+    };
+    let totalLines = {
+      added: 0,
+      deleted: 0
+    };
+    let repoStats = {};
+    
+    // テスト用に処理するリポジトリ数を制限（オプション）
+  const MAX_REPOS = 10;
+  const limitedRepos = repositories.slice(0, MAX_REPOS);
+  
+  // 各リポジトリのPR情報を取得
+    for (const repo of limitedRepos) {
+      console.log(`リポジトリ ${repo} の処理中...`);
+      repoStats[repo] = {
+        prCount: 0,
+        files: {
+          changed: 0,
+          added: 0, 
+          deleted: 0,
+          modified: 0
+        },
+        lines: {
+          added: 0,
+          deleted: 0
+        }
+      };
+      
+      // 設定から各種パラメータを取得
+      const configData = loadConfigFile();
+      const baseRef = configData.baseRef || 'master';
+      const filterKeyword = configData.filterKeyword || null;
+      const githubOwner = configData.githubOwner || null;
+      
+      // リポジトリのPRを取得（各パラメータを設定から指定）
+      const prs = await fetchPRsForRepository(repo, dateRange, baseRef, filterKeyword, githubOwner);
+      
+      // 条件に合うPRのみを処理
+      for (const pr of prs) {
+        // DependabotのPRは除外
+        if (pr.author.login === 'dependabot') {
+          console.log(`Dependabotによる PR "${pr.title}" をスキップします`);
+          continue;
+        }
+        
+        // ライブラリアップデート関連のPRは除外
+        if (isLibraryUpdatePR(pr)) {
+          console.log(`ライブラリアップデート関連の PR "${pr.title}" をスキップします`);
+          continue;
+        }
+        
+        // フィルターキーワードが指定されている場合、タイトルまたは本文にキーワードが含まれるPRをスキップ
+        if (filterKeyword && (pr.title.toLowerCase().includes(filterKeyword.toLowerCase()) || 
+            (pr.bodyText && pr.bodyText.toLowerCase().includes(filterKeyword.toLowerCase())))) {
+          console.log(`キーワード "${filterKeyword}" を含む PR "${pr.title}" をスキップします`);
+          continue;
+        }
+        
+        // ファイル変更の種類をカウント
+        const fileTypes = {
+          added: 0,
+          deleted: 0,
+          modified: 0
+        };
+        
+        pr.files.nodes.forEach(file => {
+          switch (file.changeType) {
+            case 'ADDED': fileTypes.added++; break;
+            case 'DELETED': fileTypes.deleted++; break;
+            case 'MODIFIED': fileTypes.modified++; break;
+          }
+        });
+        
+        // 対象となったPRのタイトルをログ出力
+        console.log(`対象PR: "${pr.title}" (作成者: ${pr.author.login}, ファイル: ${pr.changedFiles}個, +${pr.additions}/-${pr.deletions}行)`);        
+        
+        // 統計情報を集計
+        repoStats[repo].prCount++;
+        repoStats[repo].files.changed += pr.changedFiles;
+        repoStats[repo].files.added += fileTypes.added;
+        repoStats[repo].files.deleted += fileTypes.deleted;
+        repoStats[repo].files.modified += fileTypes.modified;
+        repoStats[repo].lines.added += pr.additions;
+        repoStats[repo].lines.deleted += pr.deletions;
+      }
+      
+      // リポジトリごとの集計を合計に追加
+      totalPRs += repoStats[repo].prCount;
+      totalFiles.changed += repoStats[repo].files.changed;
+      totalFiles.added += repoStats[repo].files.added;
+      totalFiles.deleted += repoStats[repo].files.deleted;
+      totalFiles.modified += repoStats[repo].files.modified;
+      totalLines.added += repoStats[repo].lines.added;
+      totalLines.deleted += repoStats[repo].lines.deleted;
+      
+      console.log(`${repo}: ${repoStats[repo].prCount} PRs, ${repoStats[repo].files.changed} ファイル変更, +${repoStats[repo].lines.added} / -${repoStats[repo].lines.deleted} 行`);
+    }
+    
+    console.log('分析完了');
+    console.log(`合計: ${totalPRs}件のPR, ${totalFiles.changed}ファイル変更, +${totalLines.added} / -${totalLines.deleted} 行`);
+    
+    // GitHub Actions出力
+    console.log(`::set-output name=total_prs::${totalPRs}`);
+    console.log(`::set-output name=total_files_changed::${totalFiles.changed}`);
+    console.log(`::set-output name=total_lines_added::${totalLines.added}`);
+    console.log(`::set-output name=total_lines_deleted::${totalLines.deleted}`);
+  } catch (error) {
+    console.error('エラーが発生しました:', error.message);
+    process.exit(1);
+  }
+}
+
+// タイムアウト設定（5分後に強制終了）
+const TIMEOUT_MS = 5 * 60 * 1000;
+const timeout = setTimeout(() => {
+  console.error('タイムアウト: スクリプトの実行時間が長すぎるため強制終了します');
+  process.exit(1);
+}, TIMEOUT_MS);
+
+// タイムアウトをクリアするためにmain関数の実行完了後に呼び出すラッパー
+async function runMain() {
+  try {
+    await main();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+runMain();

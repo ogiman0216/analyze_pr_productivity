@@ -1,0 +1,11 @@
+{
+  "mode": "custom",
+  "startDate": "2025-06-01",
+  "endDate": "2025-06-30",
+  "comment": "'mode'は'lastMonth'(前月)または'custom'(カスタム期間)を指定可能",
+  "githubOwner": "",
+  "specificRepositories": [
+  ],
+  "baseRef": "master",
+  "filterKeyword": ""
+}
