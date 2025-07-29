@@ -18,6 +18,12 @@ Dependabotによって作成されたPRやライブラリアップデート関�
 2. 依存関係をインストールします:
 
 ```bash
+npm install
+```
+
+   または、個別にインストールする場合:
+
+```bash
 npm install @octokit/graphql axios dayjs
 ```
 
@@ -63,6 +69,35 @@ export GITHUB_TOKEN=your_github_token_here
 ```bash
 node analyze_pr_productivity
 ```
+
+## 実行結果の例
+
+スクリプトを実行すると、以下のような出力が表示されます：
+
+```
+
+=== 全期間集計結果 ===
+分析期間: 2024-03-01 から 2024-03-31
+全体合計: 280件のPR, 2061件のコミット, 2070ファイル変更, +114816 / -45849 行
+
+=== 月ごとの集計サマリ ===
+2024年03月: 280 PRs, 2061 commits, 2070 ファイル変更, +114816/-45849 行
+
+分析完了
+
+::set-output name=total_prs::280
+::set-output name=total_commits::2061
+::set-output name=total_files_changed::2070
+::set-output name=total_lines_added::114816
+::set-output name=total_lines_deleted::45849
+```
+
+### 出力の説明
+
+- **月次集計結果**: 各月ごとのPR数、コミット数、ファイル変更数、行数変更の統計
+- **全期間集計結果**: 分析期間全体の合計統計
+- **月ごとの集計サマリ**: 各月の結果を1行でまとめた概要
+- **GitHub Actions出力**: CI/CDパイプラインで使用可能な出力変数（`::set-output`形式）
 
 ## 設定ファイルの詳細説明
 

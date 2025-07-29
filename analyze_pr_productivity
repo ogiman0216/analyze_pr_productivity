@@ -81,6 +81,36 @@ function getLastMonthDateRange() {
   };
 }
 
+// 指定期間を月ごとに分割する
+function splitDateRangeByMonth(startDate, endDate) {
+  const start = dayjs(startDate).tz('Asia/Tokyo');
+  const end = dayjs(endDate).tz('Asia/Tokyo');
+  const ranges = [];
+  
+  let current = start.startOf('day');
+  
+  while (current.isBefore(end) || current.isSame(end, 'day')) {
+    const monthStart = current;
+    const monthEnd = current.endOf('month');
+    
+    // 終了日が月末より前の場合は終了日を使用
+    const actualEnd = monthEnd.isAfter(end) ? end : monthEnd;
+    
+    ranges.push({
+      startDate: monthStart.format('YYYY-MM-DD'),
+      endDate: actualEnd.format('YYYY-MM-DD'),
+      startDateRFC: monthStart.startOf('day').format('YYYY-MM-DDTHH:mm:ssZ'),
+      endDateRFC: actualEnd.endOf('day').format('YYYY-MM-DDTHH:mm:ssZ'),
+      monthLabel: monthStart.format('YYYY年MM月')
+    });
+    
+    // 次の月の1日に移動
+    current = current.add(1, 'month').startOf('month');
+  }
+  
+  return ranges;
+}
+
 // 設定ファイルからリポジトリリストを取得
 async function searchRepositories() {
   const configData = loadConfigFile();
@@ -176,7 +206,7 @@ async function fetchPRsForRepository(repo, dateRange, baseRef = 'master', filter
   // 無限ループ防止用カウンター
   let pageCounter = 0;
   // リポジトリによってページ数制限を変更
-  const MAX_PAGES = 30 ;
+  const MAX_PAGES = 35 ;
   
   while (hasNextPage && pageCounter < MAX_PAGES) {
     pageCounter++;
@@ -255,65 +285,248 @@ async function fetchPRsForRepository(repo, dateRange, baseRef = 'master', filter
   return allPRs;
 }
 
+// 指定されたリポジトリのコミット数を取得するGraphQLクエリ
+async function fetchCommitsForRepository(repo, dateRange, baseRef = 'master', owner = null) {
+  // 設定ファイルから設定を取得
+  const configData = loadConfigFile();
+  
+  // GitHubオーナー名が指定されていない場合は設定ファイルから取得
+  if (!owner) {
+    owner = configData.githubOwner;
+  }
+  
+  // ownerが設定されていない場合はエラーを投げる
+  if (!owner) {
+    throw new Error(`GitHubのオーナー名（組織名）が設定されていません。date_range_config.jsonにgithubOwnerを設定してください。`);
+  }
+  
+  // メールドメインフィルタリングは無効化
+  // const emailDomain = configData.emailDomain;
+
+  // ページネーションでコミットを全件取得
+  let allCommits = [];
+  let hasNextPage = true;
+  let cursor = null;
+  let totalCount = 0;
+  let pageCount = 0;
+  
+  while (hasNextPage && pageCount < 100) { // 最大10ページまで（安全装置）
+    pageCount++;
+    console.log(`  ${repo}: コミット情報を取得中... (ページ ${pageCount})`);
+    
+    const query = `
+      query($owner: String!, $repo: String!, $since: GitTimestamp!, $until: GitTimestamp!, $cursor: String) {
+        repository(owner: $owner, name: $repo) {
+          defaultBranchRef {
+            target {
+              ... on Commit {
+                history(since: $since, until: $until, first: 100, after: $cursor) {
+                  totalCount
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                  nodes {
+                    author {
+                      user {
+                        login
+                      }
+                    }
+                    committedDate
+                    message
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const variables = {
+      owner,
+      repo,
+      since: dateRange.startDateRFC,
+      until: dateRange.endDateRFC,
+      cursor
+    };
+
+    try {
+      const result = await graphqlWithAuth(query, variables);
+      
+      if (!result.repository || !result.repository.defaultBranchRef) {
+        console.log(`  ${repo}: リポジトリまたはデフォルトブランチが見つかりません`);
+        return { totalCount: 0, filteredCount: 0, commits: [] };
+      }
+      
+      const history = result.repository.defaultBranchRef.target.history;
+      totalCount = history.totalCount;
+      
+      // 新しいコミットを配列に追加
+      allCommits = allCommits.concat(history.nodes);
+      
+      // 次のページの情報を更新
+      hasNextPage = history.pageInfo.hasNextPage;
+      cursor = history.pageInfo.endCursor;
+      
+      console.log(`  ${repo}: ページ ${pageCount} 完了 (${history.nodes.length}件取得, 累計: ${allCommits.length}件)`);
+      
+    } catch (error) {
+      console.error(`  ${repo}: ページ ${pageCount} の取得中にエラー: ${error.message}`);
+      break;
+    }
+  }
+  
+  // 全件取得完了後の処理
+  try {
+    // 疑似的なcommitsオブジェクトを作成（既存のコードとの互換性のため）
+    const commits = {
+      totalCount: totalCount,
+      nodes: allCommits
+    };
+    
+    // フィルタリング処理でコミットを分類
+    const filteredCommits = [];
+    const excludedCommits = [];
+    
+    commits.nodes.forEach(commit => {
+      const authorLogin = commit.author?.user?.login;
+      const authorEmail = commit.author?.email;
+      
+      let shouldInclude = true;
+      let excludeReason = '';
+      
+      // ボットアカウントを除外
+      if (authorLogin && (
+        authorLogin.includes('dependabot') || 
+        authorLogin.includes('bot') ||
+        authorLogin.endsWith('[bot]')
+      )) {
+        shouldInclude = false;
+        excludeReason = 'ボットアカウント';
+      }
+      
+      if (shouldInclude) {
+        filteredCommits.push(commit);
+      } else {
+        excludedCommits.push({ commit, reason: excludeReason });
+      }
+    });
+
+    console.log(`  ${repo}: ${commits.totalCount}件のコミット（除外: ${excludedCommits.length}件, 有効: ${filteredCommits.length}件）`);
+    
+    return {
+      totalCount: commits.totalCount,
+      filteredCount: filteredCommits.length,
+      commits: filteredCommits
+    };
+  } catch (error) {
+    console.error(`リポジトリ ${repo} のコミット取得中にエラー: ${error.message}`);
+    return { totalCount: 0, filteredCount: 0, commits: [] };
+  }
+}
+
 async function main() {
   try {
     // 設定ファイルまたは前月の日付範囲を取得
     const dateRange = getDateRangeFromConfig();
-    console.log(`分析対象期間: ${dateRange.startDate} から ${dateRange.endDate}${dateRange.isCustomRange ? ' (カスタム設定)' : ' (前月自動設定)'}`);
+    console.log(`分析期間: ${dateRange.startDate} から ${dateRange.endDate}`);
     
-    // 対象リポジトリを取得
+    // 期間を月ごとに分割
+    const monthlyRanges = splitDateRangeByMonth(dateRange.startDate, dateRange.endDate);
+    console.log(`期間を${monthlyRanges.length}つの月に分割しました`);
+    
+    // リポジトリリストを取得
     const repositories = await searchRepositories();
-    console.log(`検出されたリポジトリ: ${repositories.length}件`);
+    if (repositories.length === 0) {
+      console.log('分析対象のリポジトリがありません');
+      return;
+    }
     
-    // 結果を格納する変数
-    let totalPRs = 0;
-    let totalFiles = {
+    console.log(`分析対象リポジトリ: ${repositories.join(', ')}`);
+    
+    // 全体の合計用変数
+    let grandTotalPRs = 0;
+    let grandTotalCommits = 0;
+    let grandTotalFiles = {
       changed: 0,
-      added: 0,
-      deleted: 0,
-      modified: 0
-    };
-    let totalLines = {
       added: 0,
       deleted: 0
     };
-    let repoStats = {};
+    let grandTotalLines = {
+      added: 0,
+      deleted: 0
+    };
+    
+    // 月ごとの結果を保存
+    const monthlyResults = [];
     
     // テスト用に処理するリポジトリ数を制限（オプション）
-  const MAX_REPOS = 10;
-  const limitedRepos = repositories.slice(0, MAX_REPOS);
-  
-  // 各リポジトリのPR情報を取得
-    for (const repo of limitedRepos) {
-      console.log(`リポジトリ ${repo} の処理中...`);
-      repoStats[repo] = {
-        prCount: 0,
-        files: {
-          changed: 0,
-          added: 0, 
-          deleted: 0,
-          modified: 0
-        },
-        lines: {
-          added: 0,
-          deleted: 0
-        }
+    const MAX_REPOS = 10;
+    const limitedRepos = repositories.slice(0, MAX_REPOS);
+    
+    // 設定から各種パラメータを取得
+    const configData = loadConfigFile();
+    const baseRef = configData.baseRef || 'master';
+    const filterKeyword = configData.filterKeyword || null;
+    const githubOwner = configData.githubOwner || null;
+    
+    // 月ごとに集計処理を実行
+    for (const monthRange of monthlyRanges) {
+      console.log(`\n=== ${monthRange.monthLabel} の集計開始 ===`);
+      console.log(`期間: ${monthRange.startDate} から ${monthRange.endDate}`);
+      
+      let monthlyTotalPRs = 0;
+      let monthlyTotalCommits = 0;
+      let monthlyTotalFiles = {
+        changed: 0,
+        added: 0,
+        deleted: 0
       };
+      let monthlyTotalLines = {
+        added: 0,
+        deleted: 0
+      };
+      let monthlyRepoStats = {};
       
-      // 設定から各種パラメータを取得
-      const configData = loadConfigFile();
-      const baseRef = configData.baseRef || 'master';
-      const filterKeyword = configData.filterKeyword || null;
-      const githubOwner = configData.githubOwner || null;
-      
-      // リポジトリのPRを取得（各パラメータを設定から指定）
-      const prs = await fetchPRsForRepository(repo, dateRange, baseRef, filterKeyword, githubOwner);
+      // 各リポジトリのPR情報を取得
+      for (const repo of limitedRepos) {
+        console.log(`リポジトリ ${repo} の処理中...`);
+        monthlyRepoStats[repo] = {
+          prCount: 0,
+          commitCount: 0,
+          files: {
+            changed: 0,
+            added: 0, 
+            deleted: 0,
+            modified: 0
+          },
+          lines: {
+            added: 0,
+            deleted: 0
+          }
+        };
+        
+        // リポジトリのPRを取得（月ごとの期間で）
+        const prs = await fetchPRsForRepository(repo, monthRange, baseRef, filterKeyword, githubOwner);
+        
+        // リポジトリのコミット数を取得
+        const commitData = await fetchCommitsForRepository(repo, monthRange, baseRef, githubOwner);
+        monthlyRepoStats[repo].commitCount = commitData.filteredCount;
       
       // 条件に合うPRのみを処理
+      console.log(`対象のPRを条件に沿って処理します。対象のPR数: ${prs.length}件`);
+      
       for (const pr of prs) {
         // DependabotのPRは除外
-        if (pr.author.login === 'dependabot') {
+        if (pr.author && pr.author.login === 'dependabot') {
           console.log(`Dependabotによる PR "${pr.title}" をスキップします`);
+          continue;
+        }
+        
+        // authorがnullの場合はスキップ
+        if (!pr.author || !pr.author.login) {
+          console.log(`作成者不明の PR "${pr.title}" をスキップします`);
           continue;
         }
         
@@ -346,38 +559,75 @@ async function main() {
         });
         
         // 対象となったPRのタイトルをログ出力
-        console.log(`対象PR: "${pr.title}" (作成者: ${pr.author.login}, ファイル: ${pr.changedFiles}個, +${pr.additions}/-${pr.deletions}行)`);        
+        const authorName = pr.author?.login || '不明';
+        console.log(`対象PR: "${pr.title}" (作成者: ${authorName}, ファイル: ${pr.changedFiles}個, +${pr.additions}/-${pr.deletions}行)`);        
         
         // 統計情報を集計
-        repoStats[repo].prCount++;
-        repoStats[repo].files.changed += pr.changedFiles;
-        repoStats[repo].files.added += fileTypes.added;
-        repoStats[repo].files.deleted += fileTypes.deleted;
-        repoStats[repo].files.modified += fileTypes.modified;
-        repoStats[repo].lines.added += pr.additions;
-        repoStats[repo].lines.deleted += pr.deletions;
+        monthlyRepoStats[repo].prCount++;
+        monthlyRepoStats[repo].files.changed += pr.changedFiles;
+        monthlyRepoStats[repo].files.added += fileTypes.added;
+        monthlyRepoStats[repo].files.deleted += fileTypes.deleted;
+        monthlyRepoStats[repo].files.modified += fileTypes.modified;
+        monthlyRepoStats[repo].lines.added += pr.additions;
+        monthlyRepoStats[repo].lines.deleted += pr.deletions;
       }
       
-      // リポジトリごとの集計を合計に追加
-      totalPRs += repoStats[repo].prCount;
-      totalFiles.changed += repoStats[repo].files.changed;
-      totalFiles.added += repoStats[repo].files.added;
-      totalFiles.deleted += repoStats[repo].files.deleted;
-      totalFiles.modified += repoStats[repo].files.modified;
-      totalLines.added += repoStats[repo].lines.added;
-      totalLines.deleted += repoStats[repo].lines.deleted;
+      // リポジトリごとの月次集計を月次合計に追加
+      monthlyTotalPRs += monthlyRepoStats[repo].prCount;
+      monthlyTotalCommits += monthlyRepoStats[repo].commitCount;
+      monthlyTotalFiles.changed += monthlyRepoStats[repo].files.changed;
+      monthlyTotalFiles.added += monthlyRepoStats[repo].files.added;
+      monthlyTotalFiles.deleted += monthlyRepoStats[repo].files.deleted;
+      monthlyTotalLines.added += monthlyRepoStats[repo].lines.added;
+      monthlyTotalLines.deleted += monthlyRepoStats[repo].lines.deleted;
       
-      console.log(`${repo}: ${repoStats[repo].prCount} PRs, ${repoStats[repo].files.changed} ファイル変更, +${repoStats[repo].lines.added} / -${repoStats[repo].lines.deleted} 行`);
+      console.log(`${repo}: ${monthlyRepoStats[repo].prCount} PRs, ${monthlyRepoStats[repo].commitCount} commits, ${monthlyRepoStats[repo].files.changed} ファイル変更, +${monthlyRepoStats[repo].lines.added} / -${monthlyRepoStats[repo].lines.deleted} 行`);
     }
     
-    console.log('分析完了');
-    console.log(`合計: ${totalPRs}件のPR, ${totalFiles.changed}ファイル変更, +${totalLines.added} / -${totalLines.deleted} 行`);
+    // 月次結果を保存
+    const monthlyResult = {
+      month: monthRange.monthLabel,
+      period: `${monthRange.startDate} - ${monthRange.endDate}`,
+      totalPRs: monthlyTotalPRs,
+      totalCommits: monthlyTotalCommits,
+      totalFiles: monthlyTotalFiles,
+      totalLines: monthlyTotalLines,
+      repoStats: monthlyRepoStats
+    };
+    monthlyResults.push(monthlyResult);
     
-    // GitHub Actions出力
-    console.log(`::set-output name=total_prs::${totalPRs}`);
-    console.log(`::set-output name=total_files_changed::${totalFiles.changed}`);
-    console.log(`::set-output name=total_lines_added::${totalLines.added}`);
-    console.log(`::set-output name=total_lines_deleted::${totalLines.deleted}`);
+    // 月次結果を出力
+    console.log(`\n--- ${monthRange.monthLabel} 集計結果 ---`);
+    console.log(`合計: ${monthlyTotalPRs}件のPR, ${monthlyTotalCommits}件のコミット, ${monthlyTotalFiles.changed}ファイル変更, +${monthlyTotalLines.added} / -${monthlyTotalLines.deleted} 行`);
+    
+    // 全体合計に追加
+    grandTotalPRs += monthlyTotalPRs;
+    grandTotalCommits += monthlyTotalCommits;
+    grandTotalFiles.changed += monthlyTotalFiles.changed;
+    grandTotalFiles.added += monthlyTotalFiles.added;
+    grandTotalFiles.deleted += monthlyTotalFiles.deleted;
+    grandTotalLines.added += monthlyTotalLines.added;
+    grandTotalLines.deleted += monthlyTotalLines.deleted;
+  }
+    
+    console.log('\n=== 全期間集計結果 ===');
+    console.log(`分析期間: ${dateRange.startDate} から ${dateRange.endDate}`);
+    console.log(`全体合計: ${grandTotalPRs}件のPR, ${grandTotalCommits}件のコミット, ${grandTotalFiles.changed}ファイル変更, +${grandTotalLines.added} / -${grandTotalLines.deleted} 行`);
+    
+    // 月ごとの結果サマリを表示
+    console.log('\n=== 月ごとの集計サマリ ===');
+    monthlyResults.forEach(result => {
+      console.log(`${result.month}: ${result.totalPRs} PRs, ${result.totalCommits} commits, ${result.totalFiles.changed} ファイル変更, +${result.totalLines.added}/-${result.totalLines.deleted} 行`);
+    });
+    
+    console.log('\n分析完了');
+    
+    // GitHub Actions出力（全体合計）
+    console.log(`::set-output name=total_prs::${grandTotalPRs}`);
+    console.log(`::set-output name=total_commits::${grandTotalCommits}`);
+    console.log(`::set-output name=total_files_changed::${grandTotalFiles.changed}`);
+    console.log(`::set-output name=total_lines_added::${grandTotalLines.added}`);
+    console.log(`::set-output name=total_lines_deleted::${grandTotalLines.deleted}`);
   } catch (error) {
     console.error('エラーが発生しました:', error.message);
     process.exit(1);
